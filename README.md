@@ -2,11 +2,11 @@
 
 [//]: <img src="https://github.com/user-attachments/assets/54ac039b-085e-490b-aacc-36c8e244e313" width="428" />
 
-# agtx
+# 🏄🏼‍♂️ agtx
 
 <div align="left">
     
-> **An AI agent that manages other coding agents in a terminal kanban board** - Add tasks. Press one key. An orchestrator agent picks it up, plans, and delegates to multiple coding agents running in parallel. Come back to changes ready to merge.
+> **The blackboard for coding agents** - Add tasks. Press one key. An orchestrator agent picks it up, plans, and delegates to multiple coding agents running in parallel. Come back to changes ready to merge.
 >
 > **Let different AI coding agents collaborate** autonomously on the same task with automatic session switching and context awareness - e.g. **Gemini** → research | **Claude** → implement | **Codex** → review
 >
@@ -19,6 +19,8 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
+<a href="https://trendshift.io/repositories/23889" target="_blank"><img src="https://trendshift.io/api/badge/repositories/23889" alt="fynnfluegge%2Fagtx | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+
 <p align="center">
   <a href="#quick-start">Quick Start</a> •
   <a href="#features">Features</a> •
@@ -27,7 +29,8 @@
   <a href="#mcp-server">MCP Server</a> •
   <a href="#plugins">Plugins</a> •
   <a href="#orchestrator-agent-experimental">Orchestrator</a> •
-  <a href="#configuration">Configuration</a>
+  <a href="#configuration">Configuration</a> •
+  <a href="#benchmarks">Benchmarks</a>
 </p>
 
 ---
@@ -643,6 +646,12 @@ The orchestrator communicates with agtx through the [Model Context Protocol (MCP
 5. If a task has been idle for 1+ minute without a phase artifact, the orchestrator is notified — it reads the pane with `read_pane_content`, then either nudges the agent with `send_to_task` or calls `move_task` with `escalate_to_user` to flag it for your attention
 6. Escalated tasks show a `⚠` badge on the kanban board; opening the task popup shows the reason and dismisses the flag
 7. MCP registration is cleaned up when the orchestrator is stopped
+
+## Benchmarks
+
+agtx includes a [SWE-bench Lite](https://www.swebench.com) benchmark runner that uses agtx itself as the agent orchestration layer — driving coding agent workflows against 300 real GitHub bug-fix tasks via the MCP server.
+
+See **[benchmarks/README.md](benchmarks/README.md)** for setup, usage, bundled configs, and evaluation instructions.
 
 ## Contributing
 
