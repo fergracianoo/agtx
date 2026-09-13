@@ -30,9 +30,25 @@ pub const ACTIONS: &[&str] = &[
     "move_to_running",
     "move_to_review",
     "move_to_done",
+    "move_to_done_and_merge",
     "resume",
     "escalate_to_user",
 ];
+
+/// Whether a task's agent can be sent a message through `send_to_task`.
+///
+/// Planning, Running and Review all have a live agent in their window. Review is
+/// included so a reviewer can be handed a small fix in place, with no board
+/// transition made just to deliver a message. `resume` sends the task round a
+/// whole execute cycle, and is for going back to implement more.
+///
+/// Backlog has no agent unless it is researching, and Done has none at all.
+pub fn accepts_task_input(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Planning | TaskStatus::Running | TaskStatus::Review
+    )
+}
 
 /// The longest a task title may be. Mirrors the wizard's own cap, so a task
 /// created from a phone cannot be one the desktop refuses to edit.
@@ -68,6 +84,13 @@ pub fn allowed_actions(task: &Task, deps_satisfied: bool, caller: CallerKind) ->
         TaskStatus::Review => {
             actions.push("move_to_done".to_string());
             actions.push("resume".to_string());
+            // Integrating locally is the unattended caller's problem alone. A
+            // person reaches Done through a PR merged on the remote, and
+            // offering them a button that merges into their own checkout
+            // instead would be a second, conflicting way to land the same work.
+            if caller == CallerKind::Orchestrator {
+                actions.push("move_to_done_and_merge".to_string());
+            }
         }
         TaskStatus::Done => {}
     }

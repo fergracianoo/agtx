@@ -538,30 +538,348 @@ fn test_normal_messages_pass_validation() {
 #[test]
 #[cfg(feature = "test-mocks")]
 fn test_send_to_task_requires_active_phase() {
-    // Tasks in Backlog, Review, or Done should not accept send_to_task
+    // The real rule, not a copy of it: the server calls this same function.
+    use agtx::core::actions::accepts_task_input;
+
+    // No agent to receive it.
+    for status in [TaskStatus::Backlog, TaskStatus::Done] {
+        assert!(!accepts_task_input(status), "{status:?} must refuse input");
+    }
+    // Review is included so a reviewer can be handed a small fix in place,
+    // rather than the task being resumed to Running just to deliver a message.
+    for status in [TaskStatus::Planning, TaskStatus::Running, TaskStatus::Review] {
+        assert!(accepts_task_input(status), "{status:?} must accept input");
+    }
+}
+
+// === Local integration action ===
+
+fn review_task() -> Task {
+    let mut t = Task::new("Add the thing", "claude", "p1");
+    t.status = TaskStatus::Review;
+    t
+}
+
+/// Merging into the project's own checkout is the unattended caller's path to
+/// Done. A person lands the same work by merging the PR on the remote, so
+/// offering them both would be two ways to land one branch.
+#[test]
+fn local_merge_is_offered_to_the_orchestrator_and_not_to_a_person() {
+    use agtx::core::actions::{allowed_actions, CallerKind};
+
+    let task = review_task();
+    let orchestrator = allowed_actions(&task, true, CallerKind::Orchestrator);
+    let human = allowed_actions(&task, true, CallerKind::Human);
+
+    assert!(orchestrator.contains(&"move_to_done_and_merge".to_string()));
+    assert!(!human.contains(&"move_to_done_and_merge".to_string()));
+    // It is an addition, not a replacement: a caller that does its integration
+    // elsewhere still reaches Done the plain way.
+    assert!(orchestrator.contains(&"move_to_done".to_string()));
+    assert!(human.contains(&"move_to_done".to_string()));
+}
+
+#[test]
+fn local_merge_is_only_valid_from_review() {
+    use agtx::core::actions::{validate_action, CallerKind};
+
+    let task = review_task();
+    assert!(validate_action(&task, true, CallerKind::Orchestrator, "move_to_done_and_merge").is_ok());
+
+    for status in [
+        TaskStatus::Backlog,
+        TaskStatus::Planning,
+        TaskStatus::Running,
+        TaskStatus::Done,
+    ] {
+        let mut t = review_task();
+        t.status = status;
+        assert!(
+            validate_action(&t, true, CallerKind::Orchestrator, "move_to_done_and_merge").is_err(),
+            "should be refused from {}",
+            status.as_str()
+        );
+    }
+}
+
+/// The verb has to be in `ACTIONS` or `move_task` rejects it as unknown before
+/// it ever reaches the executor.
+#[test]
+fn local_merge_is_a_known_action() {
+    assert!(agtx::core::actions::ACTIONS.contains(&"move_to_done_and_merge"));
+}
+
+// === Reclaiming a dead instance's claims ===
+
+/// A Backlog transition is claimed when picked up but only *marked* once the
+/// serialized setup slot frees up and it actually starts. A TUI that exits in
+/// between strands it: the row is claimed, so `get_pending_transition_requests`
+/// filters it out and no restarted TUI ever runs it.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn a_dead_instance_claim_is_reclaimed_and_becomes_pending_again() {
     let db = Database::open_in_memory_project().unwrap();
+    let req = TransitionRequest::new("task-1", "move_to_planning");
+    db.create_transition_request(&req).unwrap();
+    assert!(db.claim_transition_request(&req.id, "dead-instance").unwrap());
+    assert!(
+        db.get_pending_transition_requests().unwrap().is_empty(),
+        "a claimed row is invisible to the drain — that is what strands it"
+    );
 
-    for status in &[TaskStatus::Backlog, TaskStatus::Review, TaskStatus::Done] {
-        let mut task = Task::new("Test", "claude", "proj");
-        task.status = *status;
-        db.create_task(&task).unwrap();
+    // Zero window: everything not held by this instance is fair game.
+    let n = db
+        .reclaim_stale_transition_requests("live-instance", chrono::Duration::zero())
+        .unwrap();
 
-        // The server checks: !matches!(task.status, TaskStatus::Planning | TaskStatus::Running)
-        assert!(
-            !matches!(task.status, TaskStatus::Planning | TaskStatus::Running),
-            "Status {:?} should not be an active phase for send_to_task",
-            status
-        );
+    assert_eq!(n, 1);
+    let pending = db.get_pending_transition_requests().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, req.id);
+}
+
+/// This instance's own claims are its in-memory queue. Reclaiming them would
+/// have it race itself and set the same worktree up twice.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn an_instance_never_reclaims_its_own_claims() {
+    let db = Database::open_in_memory_project().unwrap();
+    let req = TransitionRequest::new("task-1", "move_to_planning");
+    db.create_transition_request(&req).unwrap();
+    db.claim_transition_request(&req.id, "me").unwrap();
+
+    let n = db
+        .reclaim_stale_transition_requests("me", chrono::Duration::zero())
+        .unwrap();
+
+    assert_eq!(n, 0);
+    assert!(db.get_pending_transition_requests().unwrap().is_empty());
+}
+
+/// The age window is what keeps a *live* second instance's genuine backlog out
+/// of reach — a queued task waits out every setup ahead of it.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn a_recent_claim_is_left_alone() {
+    let db = Database::open_in_memory_project().unwrap();
+    let req = TransitionRequest::new("task-1", "move_to_planning");
+    db.create_transition_request(&req).unwrap();
+    db.claim_transition_request(&req.id, "other-instance").unwrap();
+
+    let n = db
+        .reclaim_stale_transition_requests("me", chrono::Duration::minutes(5))
+        .unwrap();
+
+    assert_eq!(n, 0, "claimed seconds ago — the other instance may be alive");
+}
+
+/// A processed row is finished, whoever claimed it.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn a_processed_request_is_not_reclaimed() {
+    let db = Database::open_in_memory_project().unwrap();
+    let req = TransitionRequest::new("task-1", "move_to_planning");
+    db.create_transition_request(&req).unwrap();
+    db.claim_transition_request(&req.id, "dead-instance").unwrap();
+    db.mark_transition_processed(&req.id, None).unwrap();
+
+    let n = db
+        .reclaim_stale_transition_requests("me", chrono::Duration::zero())
+        .unwrap();
+
+    assert_eq!(n, 0);
+    assert!(db.get_pending_transition_requests().unwrap().is_empty());
+}
+
+// === wait_for_board_change: what wakes a caller, and what it is shown ===
+
+use agtx::mcp::board_watch::{BoardView, TaskMark};
+
+fn mark(status: TaskStatus, phase: Option<&str>) -> TaskMark {
+    TaskMark {
+        status,
+        phase_status: phase.map(str::to_string),
+        turn_ts: None,
+        deps_satisfied: true,
+        escalation_note: None,
     }
+}
 
-    // Planning and Running should be allowed
-    for status in &[TaskStatus::Planning, TaskStatus::Running] {
-        let mut task = Task::new("Test", "claude", "proj");
-        task.status = *status;
-        assert!(
-            matches!(task.status, TaskStatus::Planning | TaskStatus::Running),
-            "Status {:?} should be an active phase for send_to_task",
-            status
-        );
-    }
+fn board(tasks: &[(&str, TaskMark)]) -> Vec<(String, TaskMark)> {
+    tasks
+        .iter()
+        .map(|(id, m)| (id.to_string(), m.clone()))
+        .collect()
+}
+
+/// A view whose caller has already been shown `tasks`.
+fn seen(tasks: &[(String, TaskMark)]) -> BoardView {
+    let mut view = BoardView::default();
+    view.mark_seen(tasks.iter().map(|(id, m)| (id.as_str(), m)), true);
+    view
+}
+
+#[test]
+fn a_first_wait_answers_at_once_with_the_whole_board() {
+    let b = board(&[
+        ("a", mark(TaskStatus::Running, Some("working"))),
+        ("b", mark(TaskStatus::Planning, Some("working"))),
+    ]);
+    let mut view = BoardView::default();
+
+    assert!(
+        view.poll(&b, true),
+        "nothing has been shown yet — that is news"
+    );
+    assert_eq!(view.report(&b, true).changed, vec!["a", "b"]);
+}
+
+#[test]
+fn a_task_starting_to_work_does_not_wake_but_is_reported_with_what_does() {
+    let before = board(&[
+        ("a", mark(TaskStatus::Planning, Some("ready"))),
+        ("b", mark(TaskStatus::Running, Some("working"))),
+    ]);
+    let mut view = seen(&before);
+
+    // The caller advanced `a`. Its status changed and its phase went through
+    // absent to working — the expected aftermath of its own move.
+    let moved = board(&[
+        ("a", mark(TaskStatus::Running, None)),
+        ("b", mark(TaskStatus::Running, Some("working"))),
+    ]);
+    assert!(!view.poll(&moved, true));
+    let working = board(&[
+        ("a", mark(TaskStatus::Running, Some("working"))),
+        ("b", mark(TaskStatus::Running, Some("working"))),
+    ]);
+    assert!(!view.poll(&working, true));
+
+    let done = board(&[
+        ("a", mark(TaskStatus::Running, Some("working"))),
+        ("b", mark(TaskStatus::Running, Some("ready"))),
+    ]);
+    assert!(view.poll(&done, true), "b finished its phase");
+    assert_eq!(view.report(&done, true).changed, vec!["a", "b"]);
+}
+
+#[test]
+fn a_state_already_reported_does_not_wake_again() {
+    let b = board(&[("a", mark(TaskStatus::Running, Some("blocked")))]);
+    let mut view = seen(&b);
+
+    // A caller that chose to leave a blocked task alone must not be woken for
+    // it on every poll — that is a busy loop, one turn per second.
+    assert!(!view.poll(&b, true));
+    assert!(!view.poll(&b, true));
+    assert!(view.report(&b, true).changed.is_empty());
+}
+
+#[test]
+fn a_return_to_the_same_state_inside_one_wait_wakes() {
+    let idle = board(&[("a", mark(TaskStatus::Running, Some("idle")))]);
+    let mut view = seen(&idle);
+
+    // Nudged: the agent works, then goes quiet again. An agent without hooks
+    // has no turn timestamp, so the only evidence is the working in between.
+    let working = board(&[("a", mark(TaskStatus::Running, Some("working")))]);
+    assert!(!view.poll(&working, true));
+    assert!(view.poll(&idle, true), "the nudge was answered");
+    assert_eq!(
+        view.report(&idle, true).changed,
+        vec!["a"],
+        "it matches what was reported, and must be shown anyway"
+    );
+}
+
+#[test]
+fn a_new_turn_end_wakes_even_with_the_phase_unchanged() {
+    let mut first = mark(TaskStatus::Review, Some("ready"));
+    first.turn_ts = Some(100);
+    let mut view = seen(&board(&[("a", first)]));
+
+    // A small fix sent in Review: the reviewer's turn ended again while the
+    // caller was busy between two waits, so no poll saw it working.
+    let mut second = mark(TaskStatus::Review, Some("ready"));
+    second.turn_ts = Some(160);
+    let b = board(&[("a", second)]);
+    assert!(view.poll(&b, true));
+    assert_eq!(view.report(&b, true).changed, vec!["a"]);
+}
+
+#[test]
+fn reaching_done_wakes_and_a_startable_backlog_task_wakes() {
+    let mut blocked_dep = mark(TaskStatus::Backlog, None);
+    blocked_dep.deps_satisfied = false;
+    let before = board(&[
+        ("a", mark(TaskStatus::Review, Some("ready"))),
+        ("b", blocked_dep),
+    ]);
+    let mut view = seen(&before);
+
+    let after = board(&[
+        ("a", mark(TaskStatus::Done, None)),
+        ("b", mark(TaskStatus::Backlog, None)),
+    ]);
+    assert!(view.poll(&after, true));
+    assert_eq!(view.report(&after, true).changed, vec!["a", "b"]);
+}
+
+#[test]
+fn a_blocked_dependency_alone_does_not_wake() {
+    let mut waiting = mark(TaskStatus::Backlog, None);
+    waiting.deps_satisfied = false;
+    let b = board(&[("a", waiting)]);
+    let mut view = seen(&b);
+
+    assert!(!view.poll(&b, true));
+}
+
+#[test]
+fn an_escalation_wakes() {
+    let b = board(&[("a", mark(TaskStatus::Review, Some("working")))]);
+    let mut view = seen(&b);
+
+    let mut escalated = mark(TaskStatus::Review, Some("working"));
+    escalated.escalation_note = Some("merge conflict in src/lib.rs".to_string());
+    assert!(view.poll(&board(&[("a", escalated)]), true));
+}
+
+#[test]
+fn a_deleted_task_wakes_and_is_listed_as_removed() {
+    let b = board(&[
+        ("a", mark(TaskStatus::Running, Some("working"))),
+        ("b", mark(TaskStatus::Backlog, None)),
+    ]);
+    let mut view = seen(&b);
+
+    let after = board(&[("a", mark(TaskStatus::Running, Some("working")))]);
+    assert!(view.poll(&after, true));
+    let diff = view.report(&after, true);
+    assert!(diff.changed.is_empty());
+    assert_eq!(diff.removed, vec!["b"]);
+
+    assert!(!view.poll(&after, true), "reported once, not again");
+}
+
+#[test]
+fn the_tui_going_away_wakes() {
+    let b = board(&[("a", mark(TaskStatus::Running, Some("working")))]);
+    let mut view = seen(&b);
+
+    assert!(!view.poll(&b, true));
+    assert!(
+        view.poll(&b, false),
+        "every phase status is frozen from here"
+    );
+    view.report(&b, false);
+    assert!(!view.poll(&b, false));
+}
+
+#[test]
+fn what_a_listing_showed_does_not_wake_the_next_wait() {
+    let b = board(&[("a", mark(TaskStatus::Running, Some("ready")))]);
+    let mut view = seen(&b);
+
+    assert!(!view.poll(&b, true), "list_tasks already showed a as ready");
 }

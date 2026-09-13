@@ -206,6 +206,9 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE tasks ADD COLUMN base_branch TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE tasks ADD COLUMN phase_entered_at TEXT", []);
 
         // MCP transition request queue
         self.conn.execute_batch(
@@ -238,6 +241,11 @@ impl Database {
             );
             "#,
         )?;
+
+        // The status each published verdict was computed for; see `TaskRuntime::status`.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE task_runtime ADD COLUMN status TEXT", []);
 
         // Migration: add reason column to transition_requests if it doesn't exist
         let _ = self
@@ -345,8 +353,8 @@ impl Database {
     pub fn create_task(&self, task: &Task) -> Result<()> {
         self.conn.execute(
             r#"
-            INSERT INTO tasks (id, title, description, status, agent, project_id, session_name, worktree_path, branch_name, pr_number, pr_url, plugin, cycle, referenced_tasks, escalation_note, base_branch, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            INSERT INTO tasks (id, title, description, status, agent, project_id, session_name, worktree_path, branch_name, pr_number, pr_url, plugin, cycle, referenced_tasks, escalation_note, base_branch, created_at, updated_at, phase_entered_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
             "#,
             params![
                 task.id,
@@ -367,6 +375,7 @@ impl Database {
                 task.base_branch,
                 task.created_at.to_rfc3339(),
                 task.updated_at.to_rfc3339(),
+                task.phase_entered_at.map(|t| t.to_rfc3339()),
             ],
         )?;
         Ok(())
@@ -377,8 +386,8 @@ impl Database {
         for task in tasks {
             tx.execute(
                 r#"
-                INSERT INTO tasks (id, title, description, status, agent, project_id, session_name, worktree_path, branch_name, pr_number, pr_url, plugin, cycle, referenced_tasks, escalation_note, base_branch, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                INSERT INTO tasks (id, title, description, status, agent, project_id, session_name, worktree_path, branch_name, pr_number, pr_url, plugin, cycle, referenced_tasks, escalation_note, base_branch, created_at, updated_at, phase_entered_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                 "#,
                 params![
                     task.id,
@@ -399,6 +408,7 @@ impl Database {
                     task.base_branch,
                     task.created_at.to_rfc3339(),
                     task.updated_at.to_rfc3339(),
+                    task.phase_entered_at.map(|t| t.to_rfc3339()),
                 ],
             )?;
         }
@@ -406,6 +416,14 @@ impl Database {
         Ok(())
     }
 
+    /// Persist `task`. A change of status also stamps `phase_entered_at`.
+    ///
+    /// Stamped here, in the one writer every route goes through, rather than at
+    /// each call site that moves a task: a forgotten call site is a phase whose
+    /// stale artifact reads as done. The comparison is in SQL, against the stored
+    /// row — `status` in the `CASE` is the value *before* this update, since
+    /// SQLite evaluates every `SET` expression against the old row — so the stamp
+    /// needs no read first and cannot race one.
     pub fn update_task(&self, task: &Task) -> Result<()> {
         self.conn.execute(
             r#"
@@ -424,7 +442,8 @@ impl Database {
                 referenced_tasks = ?13,
                 escalation_note = ?14,
                 base_branch = ?15,
-                updated_at = ?16
+                updated_at = ?16,
+                phase_entered_at = CASE WHEN status != ?4 THEN ?17 ELSE phase_entered_at END
             WHERE id = ?1
             "#,
             params![
@@ -444,6 +463,7 @@ impl Database {
                 task.escalation_note,
                 task.base_branch,
                 task.updated_at.to_rfc3339(),
+                chrono::Utc::now().to_rfc3339(),
             ],
         )?;
         Ok(())
@@ -474,6 +494,12 @@ impl Database {
             referenced_tasks: row.get("referenced_tasks").ok().flatten(),
             escalation_note: row.get("escalation_note").ok().flatten(),
             base_branch: row.get("base_branch").ok().flatten(),
+            phase_entered_at: row
+                .get::<_, Option<String>>("phase_entered_at")
+                .ok()
+                .flatten()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
             created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>("created_at")?)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now()),
@@ -670,6 +696,42 @@ impl Database {
             params![claimant, id],
         )?;
         Ok(rows == 1)
+    }
+
+    /// Release claims left behind by a TUI that is no longer running, so the
+    /// next one re-drains them.
+    ///
+    /// A claim is taken the moment a request is picked up, but a Backlog
+    /// transition is only *marked* once the serialized setup slot frees up and
+    /// it actually starts. Between those two points the request is claimed and
+    /// unprocessed, and [`get_pending_transition_requests`] filters claimed rows
+    /// out — so a TUI that exits while a setup is queued strands it. Nothing
+    /// re-runs it; `cleanup_old_transition_requests` eventually deletes it, an
+    /// hour later, having never executed the transition the caller asked for.
+    ///
+    /// Rows claimed by `this_instance` are left alone: this instance's own
+    /// in-memory queue still owns them.
+    ///
+    /// `older_than` keeps a *live* second instance's genuine backlog out of
+    /// reach. Reclaiming one anyway is safe rather than merely unlikely — the
+    /// drain re-validates each task before starting it, so the loser of the race
+    /// resolves its copy with an error instead of setting the worktree up twice.
+    pub fn reclaim_stale_transition_requests(
+        &self,
+        this_instance: &str,
+        older_than: chrono::Duration,
+    ) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - older_than).to_rfc3339();
+        let rows = self.conn.execute(
+            "UPDATE transition_requests
+             SET claimed_by = NULL
+             WHERE processed_at IS NULL
+               AND claimed_by IS NOT NULL
+               AND claimed_by != ?1
+               AND requested_at < ?2",
+            params![this_instance, cutoff],
+        )?;
+        Ok(rows)
     }
 
     pub fn cleanup_old_transition_requests(&self) -> Result<()> {
@@ -998,10 +1060,11 @@ impl Database {
         for rt in rows {
             tx.execute(
                 "INSERT INTO task_runtime
-                     (task_id, phase_status, pane_hash, pane_changed_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                     (task_id, phase_status, pane_hash, pane_changed_at, updated_at, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(task_id) DO UPDATE SET
                      phase_status    = excluded.phase_status,
+                     status          = excluded.status,
                      pane_hash       = excluded.pane_hash,
                      pane_changed_at = excluded.pane_changed_at,
                      updated_at      = excluded.updated_at",
@@ -1011,6 +1074,7 @@ impl Database {
                     rt.pane_hash,
                     rt.pane_changed_at.map(|t| t.to_rfc3339()),
                     rt.updated_at.to_rfc3339(),
+                    rt.status.map(|s| s.as_str()),
                 ],
             )?;
         }
@@ -1055,6 +1119,11 @@ impl Database {
             // the honest fallback: it is the state that claims the least.
             phase_status: PhaseStatus::from_str(&row.get::<_, String>("phase_status")?)
                 .unwrap_or(PhaseStatus::Working),
+            status: row
+                .get::<_, Option<String>>("status")
+                .ok()
+                .flatten()
+                .and_then(|s| TaskStatus::from_str(&s)),
             pane_hash: row.get("pane_hash")?,
             pane_changed_at: row
                 .get::<_, Option<String>>("pane_changed_at")?

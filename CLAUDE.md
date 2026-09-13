@@ -129,7 +129,9 @@ web/                   # The mobile PWA — plain ES modules, no build step
 
 skills/                # Plugin skill files — auto-discovered as /agtx:* (Claude) or @agtx:* (Codex)
 ├── sweep/SKILL.md     # Sweep skill — push any conversation to the board (/agtx:sweep)
-└── brainstorm/SKILL.md # Brainstorm skill — free-form exploration (/agtx:brainstorm)
+├── brainstorm/SKILL.md # Brainstorm skill — free-form exploration (/agtx:brainstorm)
+└── oneshot/SKILL.md   # Oneshot skill — an outside session runs the board as the human,
+                       # all five columns, driven by wait_for_board_change (/agtx:oneshot)
 
 .claude-plugin/        # Claude Code plugin manifest
 ├── plugin.json        # Plugin metadata + MCP server registration
@@ -232,6 +234,94 @@ Three properties, none of them incidental:
 have a worktree and no branch. Branch deletion stays paired with having had a worktree on purpose: a
 task with a branch and no worktree is one that reached Done, whose branch the workflow keeps, and
 `delete_branch` is `git branch -D`.
+
+#### Reaping what a task spawned
+
+`kill-window` signals the pane's own process group, which misses anything the agent backgrounded
+into a group of its own — a dev server, a watcher, a `python3 -m http.server`. Those get reparented
+to init and keep holding their ports — a static server can go on serving a worktree that has been
+deleted, and a later agent loads stale code from it.
+
+`reap_task_processes` finds them **two ways, because neither alone is enough**:
+
+- **By environment.** `create_window` sets `AGTX_TASK_ID` on the window, and a child inherits the
+  environment at spawn and never loses it. This is the one that catches a daemonized process, and
+  attribution is exact.
+- **By descent from the pane**, as the backstop for anything that never received the environment.
+  This half runs before `kill_window`, since the parent links vanish with the window.
+
+**Descent alone is not sufficient, and ordering does not make it so.** A process reparented to init
+*before* cleanup runs is already out of the tree, which is precisely the case that matters.
+
+**The alternatives were measured and rejected.** A cwd scan (`lsof -u <uid> -d cwd`) takes ~12s;
+`lsof +D <worktree>` walks the tree — 26s on a large checkout — and matches nothing once the
+directory is gone, which is the state cleanup leaves. Session id is not readable per-process from
+`ps` on macOS (`sess=` reports 0).
+
+Whether `ps -Eww` exposes another process's environment varies by platform and by how the caller was
+launched, so `processes_for_task` reads `/proc/<pid>/environ` where it exists and falls back to `ps`
+— Linux's `ps -E` means something else entirely, so the two cannot share one command. The parsing is
+split into `pids_matching_env` and tested against fixtures, because that is the half that can
+regress into signalling the wrong pids.
+
+**A root pid is refused, not reaped.** On macOS pid 0 is the ancestor of launchd, so
+`descendants_of(0)` returns *every process on the machine*. A pane can never legitimately be pid 0
+or 1, so a value that low means tmux answered with something that is not a pane pid, and the only
+safe response is to reap nothing. `a_root_pid_is_refused_rather_than_reaped` asserts both halves —
+that pid 0 really does own the whole tree, and that cleanup declines it. agtx's own pid is filtered
+for the same reason: it cannot currently match, and the cost of being wrong is killing the board.
+
+Children are signalled before parents so a supervisor cannot restart one on the way down, TERM then
+KILL. `descendants_of` builds the tree from one `ps -Ao pid=,ppid=` snapshot rather than walking
+`/proc`, which does not exist on macOS. The signals go through the `kill` command rather than a
+`libc` dependency: this file already reaches git and tmux the same way, and it keeps the path free
+of `unsafe`.
+
+#### agtx's own files are excluded from git
+
+`.agtx/` and the per-agent configs agtx deploys show as untracked in every worktree, and
+`has_changes` — which the Done guard reads from `git status --porcelain` — counts untracked files.
+Left visible, agtx's own bookkeeping would trip agtx's own guard on a project's first task, before
+any `.gitignore` exists. A guard that cries wolf first and means it second stops being believed, and
+a caller that works around it with a committed `.gitignore` is doing agtx's job.
+
+`exclude_agtx_files_from_git` writes `AGTX_WRITTEN_PATHS` into the repository's exclude file at
+worktree setup, once, inside a marked block.
+
+**There is exactly one place this can go.** Measured against git 2.55.0: a per-worktree
+`.git/worktrees/<name>/info/exclude` is *ignored*; only `$GIT_COMMON_DIR/info/exclude` takes effect,
+and it applies to the main checkout as well as every worktree.
+
+Sharing it with the user's own checkout is safe because **exclude patterns only affect untracked
+files** — also measured, and `the_exclude_cannot_hide_a_file_the_project_tracks` pins it: a tracked
+`.mcp.json` still reports its modification with `.mcp.json` excluded. So a project that deliberately
+tracks any of these keeps tracking it, and nothing a user committed can be hidden. The patterns are
+specific rather than whole dotdirs (`.claude/commands/agtx/`, not `.claude/`) because a project may
+keep its own content there, and only what agtx creates is agtx's to hide.
+
+This is what makes `git add -A` safe in the phase skills below.
+
+#### The phase skills commit
+
+`execute.md` and `review.md` end by committing. Done requires a clean tree and merging requires
+commits, so a phase that ends with its work uncommitted leaves a task that cannot reach Done — and
+the work sits in a worktree that Done deletes. Committing is the skill's job, not something left to
+the agent's initiative or a caller's instruction.
+
+#### A repository with no commits
+
+A worktree must be cut from a commit, so `git init` with no history — the starting state of any
+greenfield project — cannot host a task as it stands. `detect_main_branch` checks the exit status
+of its `git rev-parse --abbrev-ref HEAD` fallback: on an unborn branch that fails with 128 *and
+still prints the literal string* `HEAD`, which is not a revision a worktree can be cut from
+(`git worktree add` answers `invalid reference: HEAD`).
+
+When `has_no_commits` confirms the repository is genuinely empty, `create_initial_commit` makes one
+(`git commit --allow-empty -m init`) and setup proceeds. Refusing would be defensible, but "run
+`git commit --allow-empty` and start again" is the only answer to that refusal, and an empty commit
+on a repo with no history discards nothing and conflicts with nothing. The check is what keeps this
+narrow — a repository that has commits and fails for some other reason surfaces that error and never
+has history written into it.
 
 ### Workflow Plugins
 Plugins customize the task lifecycle per phase. A plugin is a TOML file (`plugin.toml`) that defines:
@@ -736,9 +826,245 @@ A dedicated Claude Code agent that autonomously manages the kanban board. Enable
 - On startup, if an orchestrator tmux session already exists, it is detected and reconnected; catch-up notifications are created for tasks that completed phases while the TUI was down (deduplicated via `peek_notifications`)
 
 **MCP tools**:
-- Discovery: `list_projects` (global mode only)
-- Read: `list_tasks`, `get_task` (includes `allowed_actions`), `get_transition_status`, `check_conflicts`, `get_notifications`, `read_pane_content`
-- Write: `move_task` (queues a transition request; actions `research`, `move_forward`, `move_to_planning`, `move_to_running`, `move_to_review`, `move_to_done`, `resume`, `escalate_to_user`), `send_to_task` (Planning/Running only, 4096-byte cap)
+- Discovery: `list_projects` (global mode only), `get_config` (the global and project configs
+  already merged — what actually governs a run). It exists because there is no other way for a
+  caller to learn `auto_trust`: the setting is global-only *by design*, since a project config that
+  could grant itself trust defeats the trust system, and `AGTX_CONFIG_DIR` means the global file is
+  not reliably at `~/.config/agtx/config.toml`, so reading that path directly can give a stale
+  answer. The response carries both file paths, so a
+  caller can name the file to edit instead of guessing
+- Read: `list_tasks`, `get_task` (includes `allowed_actions`), `wait_for_board_change`, `get_transition_status`, `check_conflicts`, `get_notifications`, `read_pane_content`. `list_tasks` and `get_task` also carry `phase_status` + `phase_age_secs` + `tui_connected` — see *Publishing phase status* below. `list_tasks` returns `{tui_connected, tasks: [...]}` rather than a bare array: `tui_connected` is one answer for the whole board, and a caller needs it on *every* poll — a separate tool is one a polling loop skips, and skipping it means reading frozen rows as live state. `list_tasks` leaves descriptions out unless `include_description` is set, and omits empty optional fields — see *Waiting for the board to change*. `read_pane_content` returns a real tail (`pane_tail`): `capture-pane -S -N` starts N lines back in the scrollback and runs to the bottom of the visible screen, and a full-screen agent keeps no scrollback, so without the trim every read is the whole screen — measured, 15 lines asked, 49 returned
+- Write: `move_task` (queues a transition request; actions `research`, `move_forward`, `move_to_planning`, `move_to_running`, `move_to_review`, `move_to_done`, `move_to_done_and_merge`, `resume`, `escalate_to_user`), `send_to_task` (Planning, Running and Review, 4096-byte cap; delivered as a bracketed paste plus a watched submit — see *When a phase counts as done*). Review is included (`accepts_task_input`) so a reviewer can be handed a small fix in place, with no transition made just to send a message; `resume` sends the task round a whole execute cycle and is for significant rework
+
+#### Publishing phase status
+
+`task_runtime` is how a process that is not the TUI learns a phase's status, and
+the TUI publishes it only while someone is reading — `board_watch`, a 10-minute
+window. Two readers mark it: the web server on a board request, and the MCP
+server on `list_tasks` / `get_task` (throttled to 30s, since `get_task` is called
+once per task in a polling loop).
+
+**It is not gated on the `serve` feature.** A default build has no web server but
+always has `agtx mcp-serve`, and an orchestrator or oneshot session polling phase status
+is exactly the out-of-process reader the table is for; compiling the publish call
+out would leave every such client reading a table nothing ever writes.
+
+Read `phase_status` against `phase_age_secs`, never alone. The refresh
+republishes every live task on every pass, so a small age means "seen just now"
+and a large one means nothing is watching this board — which needs the opposite
+response from a task that is genuinely idle.
+
+`phase_status` is the TUI's verdict and `agent_state` is the agent's own report;
+they are not duplicates. `agent_state` needs hooks and covers five of eight
+agents, while `phase_status` covers all of them and is the only signal that can
+say `ready` (the phase artifact exists) or `exited` (the window is gone).
+
+**`tui_connected` is the one that says whether any of it is current.** It reads
+`tui_heartbeat` through `Database::tui_is_live`, on the same 6-second window the
+web API uses — three beats of `TRANSITION_POLL_INTERVAL`, so one missed tick is
+not a disconnect. Without it a caller can only *infer* a dead board from
+`phase_age_secs` climbing across every task at once, and until it does, a frozen
+row reads as live state: a task shows `blocked` while its agent works normally,
+because that was the last verdict published before the TUI exited.
+
+#### Waiting for the board to change
+
+A session supervising the board pays for every turn it takes, and a turn costs its whole
+context, re-read. Measured on a 14-task oneshot run: 336 turns, context grown to 839k
+tokens, 137M tokens of cache reads. Polling was two turns per pass — 73 `sleep` calls and
+96 `list_tasks` — and those listings were the largest share of every tool result the
+session re-read afterwards, 80% of their bytes task descriptions the caller had written
+itself.
+
+`wait_for_board_change` replaces the loop. It blocks **inside the server**, re-reading the
+board every `WAIT_POLL_INTERVAL`, and answers once — with only the tasks that differ from
+what this session was last shown by it, `list_tasks` or `get_task`. It also carries the
+outcome of every `move_task` the session queued, so `get_transition_status` needs no
+polling either. Timeout defaults to `DEFAULT_WAIT_SECS`, capped at `MAX_WAIT_SECS`; a
+timeout is an answer, not an error.
+
+- **What wakes it is narrower than what changed.** A task wakes the wait when it reaches a
+  state that needs the caller — `ready`/`idle`/`blocked`/`exited`, Done, a startable
+  Backlog task, an escalation — or appears or vanishes; also a failed transition and a
+  `tui_connected` flip. `working` and an absent phase status do not: they are what a task
+  looks like between the caller's move and its outcome, and waking on them costs a turn
+  per transition to learn nothing. Those moves are still *reported* the next time
+  something wakes. `TaskMark::needs_attention` is the rule.
+- **Per session, and held in the server.** Each client spawns its own `agtx mcp-serve`
+  over stdio, so `AgtxMcpServer::boards` lives exactly as long as the caller it
+  describes. The pure half — `src/mcp/board_watch.rs` — has no database or clock, and
+  `tests/mcp_tests.rs` drives it directly.
+- **Two maps, because each misses a case the other catches.** Against what was
+  *reported* alone, an agent nudged out of `idle` that works and stops again inside one
+  wait looks unchanged. Against the last *poll* alone, a task that went `ready` while the
+  caller was busy between two waits is already `ready` at the first poll and looks
+  unchanged too.
+- **`turn_ts` tells two `idle`s apart.** An agent with hooks stamps each turn boundary, so
+  a nudge answered while the caller was between waits — which no poll saw as `working` —
+  still reads as a new state. It is `None` while the agent reports `working`, since every
+  tool call bumps that timestamp.
+- **A state already reported does not wake again.** A caller that leaves a `blocked` task
+  for the user would otherwise be woken for it every second.
+- **It is `async`.** The sleep between polls is `tokio::time::sleep`, and each poll is a
+  synchronous helper that drops the database handle and the lock before it returns, so
+  nothing is held across an `await`.
+- **It keeps marking the board watched.** The TUI publishes phase status only while
+  someone has read it recently; a long wait is a reader for its whole length.
+
+#### When a phase counts as done
+
+`ready` promises a caller that the phase is finished — safe to advance, merge or
+resume. Three rules keep it; without them a caller acting on `ready` would
+advance a task that has done no work, resume a reviewer mid-turn, and read
+`review:ready` for a review nobody has run.
+
+- **The artifact must be written during this phase.** `Task::phase_entered_at`
+  is stamped by `Database::update_task` whenever the status changes, in either
+  direction, by a SQL `CASE` against the stored row — one writer, so no route
+  that moves a task can forget it. `phase_artifact_fresh` counts an artifact only
+  if its mtime is at or after that stamp, so the previous cycle's
+  `execute.md` cannot make a resumed task read `ready` the moment it arrives.
+  `phase_artifact_exists` stays for the gating callers, which ask whether a
+  *prior* phase ever produced its artifact. `None` (a row from before the column)
+  and glob templates fall back to existence. Research runs inside Backlog with no
+  status change, so it is not stamped; agtx refuses to start research on a task
+  that already has a session, which is the only way its artifact could be stale.
+- **A verdict applies only to the status it was computed for.** The refresh
+  snapshots tasks before its thread runs, so a transition that lands meanwhile
+  leaves the verdict describing the previous phase — Running's `execute.md`
+  reads as `review:ready`.
+  `apply_session_refresh` drops such a verdict, and `TaskRuntime::status`
+  records what each published row was computed for so MCP and the phone API can
+  withhold a row that no longer matches. `phase_age_secs` cannot catch this: the
+  row's timestamp is fresh; it is the phase that is wrong.
+- **The agent's turn must be over.** An agent writes its artifact mid-turn and
+  keeps going, so `gate_ready_on_turn` holds a fresh artifact at `working` while
+  the hook reports `working` or `blocked`. There is deliberately no timestamp
+  comparison: the status file holds only the latest event, and writing the
+  artifact is itself a tool call whose `PreToolUse` sets `working` first, so a
+  current `waiting`/`ended` must post-date the write — while hook `ts` is whole
+  seconds against a sub-second mtime, so comparing them would hold a task whose
+  `Stop` landed in the same second. It cannot hold one forever: a finished turn
+  reports `waiting`, an exited agent leaves `ended` or a missing window, and a
+  silent one's `working` record stops being trusted after `HOOK_STALE_SECS`.
+
+`send_to_task` goes through `core::input::send_user_text` — a bracketed paste and
+a watched submit — not a raw `send-keys`. Measured against Claude Code 2.1.268: a
+1644-byte message typed with `send-keys` arrived as its last 622 bytes, the first
+1022 silently dropped, while the same bytes as a bracketed paste arrived whole. A
+raw-mode `cat` received every byte either way, so tmux and the pty are not the
+cause; the agent discards the head of a large typed burst, and then acts on the
+tail of an instruction with its premise gone.
+
+#### Serialized worktree setup
+
+Worktree setup runs one at a time — `setup_rx` is a single slot — because it does
+`git worktree add`, file copies, an init script, a tmux window and an agent
+spawn. Everything that starts a Backlog task goes through `setup_queue`, which
+carries a `SetupIntent` alongside the task id: the dependency overlay's batch
+move lets each task's plugin choose between research and planning
+(`PluginDefault`), while an MCP request names one transition and must not be
+answered with a different one.
+
+A queued MCP request stays **claimed and unprocessed** — `get_transition_status`
+answers `pending` — until the drain starts it. Marking it completed at enqueue
+time would tell a caller the task had moved while it was still in a queue. Every
+way the drain can decline one (task gone, left Backlog, deps unsatisfied, the
+start itself failing) resolves the request with an error instead, because a
+dropped request leaves a caller polling `pending` forever.
+
+A busy slot never rejects a transition. `move_task` has already answered
+`queued` by then, so a rejection would be visible only to a caller polling each
+request, and nothing would retry the task.
+
+**A claim outlives the instance holding it, so claims are reclaimed.** Deferring
+the mark opens a window where a request is claimed and unprocessed, and
+`get_pending_transition_requests` filters claimed rows out — so a TUI that exits
+with a setup queued strands it, until `cleanup_old_transition_requests` deletes it
+an hour later, never executed.
+`Database::reclaim_stale_transition_requests` releases claims held by another
+instance after `RECLAIM_CLAIMS_AFTER` (5 minutes), called at the top of each
+drain rather than only at startup — a TUI that dies mid-run should not wait for
+the next launch. The age window keeps a *live* second instance's genuine backlog
+out of reach; reclaiming one anyway is safe rather than merely unlikely, since
+the drain re-validates each task and the loser resolves its copy with an error
+instead of setting the worktree up twice.
+
+#### `move_to_done_and_merge`
+
+Merges the task's branch into its base branch in the **project's own checkout**,
+then moves it to Done. It exists for a caller that integrates locally; a person
+lands the same work by merging the PR on the remote, which is why
+`allowed_actions` offers it to `Orchestrator` and not to `Human` — two ways to
+land one branch is worse than one.
+
+`git::merge_task_branch` is the primitive, and it is deliberately narrow: it
+merges only when the checkout is already on the base branch with no *tracked*
+modifications, and returns `Refused` otherwise rather than stashing, switching
+branches, or moving HEAD out from under the user. Untracked files are not part of
+the gate — the project root always has some, since worktrees live under `.agtx/`
+— and git refuses on its own if the merge would overwrite one.
+
+The alternatives are worse, and were measured: `git fetch . branch:base` needs no
+working tree but git refuses it while `base` is checked out, which is the normal
+case here; `git update-ref` evades that check but leaves the user's index
+disagreeing with HEAD, so the working tree reads as "everything deleted".
+
+**Every route to Done must appear in the uncommitted-changes guard.** Reaching Done deletes
+the worktree, and `GitOperations::has_changes` reads `git status --porcelain`, which counts
+**untracked** files — an agent that wrote its work and never ran `git commit` has all of it
+there and nowhere else. A route missing from the `matches!` list beside `move_to_done` and
+`move_forward` merges an empty branch, reaches Done, and cleanup deletes the work; only the
+`.md` artifacts survive, in `.agtx/archive/`. A new route to Done that forgets that line is
+a silent data-loss bug, not a missing check, and
+`every_route_to_done_refuses_a_worktree_with_uncommitted_work` iterates all three.
+
+**An empty branch is refused rather than merged**, as the second layer. `git merge` exits
+0 for a branch with no commits — "Already up to date" — so the exit status alone reports a
+success that landed nothing, and the caller then deletes the worktree on the strength of
+it. `commits_ahead` is checked first and `MergeOutcome::NothingToMerge` says so
+explicitly; the task stays in Review and the error names where the work would be. The two
+layers catch different states: the first, work that exists but is uncommitted; the second,
+a branch that is genuinely empty.
+
+**A conflict leaves the task in Review**, sets `escalation_note`, and sends
+`/agtx:merge-conflicts` to the task's own agent. That ordering is the whole point
+of doing both halves in one action: Done removes the worktree, and the worktree is
+where the agent that wrote the branch has to resolve it. The virtual merge
+(`check_merge_conflicts`) runs first so a conflict is *reported* rather than left
+half-applied in the user's checkout — and `merge_branch` runs `git merge --abort`
+on failure, since a stray `MERGE_HEAD` makes every later git command in the
+project root report a merge in progress.
+
+Note `fetch_and_check_conflicts` — used by the Review auto-conflict trigger — runs
+`git fetch origin` first and so is inert on a local-only repo. `merge_task_branch`
+uses the local `check_merge_conflicts`, which needs no remote.
+
+#### Incremental re-review
+
+Leaving Review for Running — the `resume` path — writes the worktree's current HEAD to
+`.agtx/reviewed-at` (`mark_reviewed_point`). The review skill reads it: present, it
+reviews `<marker>..HEAD` plus the prior `.agtx/review.md` and checks those points were
+addressed; absent, it reviews the whole branch.
+
+Without it every resume costs a full re-review: `clear_context_on_advance` means the
+review agent starts with no memory of its own previous pass, so it would re-read the
+entire branch each cycle to re-confirm what it had already approved.
+
+A file in the worktree rather than a column on `Task`: the only reader is the skill, which
+is already reading `.agtx/`, nothing queries it, and it is removed with the worktree it
+describes.
+
+**Two things about the marker's scope.** It is a commit, so it covers committed work only
+— which is why the skill pairs the range with a second command for what is not committed
+yet. The two can overlap, and that is the intended direction: work uncommitted when the
+marker was written and committed afterwards is reviewed twice, never zero times.
+
+And that second command is **`git status --short`, not `git diff HEAD`**: `git diff` does
+not show untracked files at all. A new file from the running phase is absent from the
+range diff (not committed) and absent from the working-tree diff (not tracked), so the
+obvious pairing would review it in neither. `??` lines are where the newest work usually
+is. `the_marker_never_covers_uncommitted_work` pins this.
 - CRUD (Backlog only for update/delete): `create_task`, `create_tasks_batch` (max 50, index-based `depends_on` wiring), `update_task`, `delete_task`
 
 ### MCP Server Modes
@@ -748,7 +1074,7 @@ Two modes, selected by whether a path argument is passed to `agtx mcp-serve`:
 | Mode | Command | Used by |
 |------|---------|---------|
 | **Project-scoped** | `agtx mcp-serve <path>` | Orchestrator (bound to one project) |
-| **Global** | `agtx mcp-serve` | Sweep skill, any ad-hoc session |
+| **Global** | `agtx mcp-serve` | Sweep and oneshot skills, any ad-hoc session |
 
 In global mode all CRUD tools (`list_tasks`, `create_task`, etc.) require a `project_id` parameter. The agent calls `list_projects` first to resolve it. In project-scoped mode `project_id` is ignored — the path is fixed at startup.
 
@@ -1235,11 +1561,21 @@ writes one.
   `UserPromptSubmit`, `PreToolUse` (heartbeat) → `working`; `PermissionRequest`, `Notification` →
   `blocked`; `Stop`, `StopFailure` → `waiting`; `SessionEnd` → `ended`. Unregistered names are
   ignored by the agent
+- **Claude's `Notification` is scoped to `permission_prompt`**, like grok's, and for the same
+  reason. Measured against Claude Code 2.1.263, the payload carries a `notification_type`:
+  `permission_prompt` ("Claude needs your permission") and `idle_prompt` ("Claude is waiting for
+  your input"), the latter fired ~66s after a turn simply ends. Unscoped, an agent that has simply
+  finished its turn would report `Blocked` — and an agent-reported `Blocked` fires the stuck-task
+  notification *immediately*, with no settle window, so a caller would interrupt an agent that is
+  merely quiet. Verified that Claude honours a matcher on this event: with it, an idle turn produces no
+  hook call at all. The scoping therefore lives in `hook_events`, not `map_hook_event` — the payload
+  never reaches the mapper. A worktree deployed by an earlier binary keeps the unscoped
+  registration until `refresh_stale_worktree_configs` re-deploys it
 - **`src/agent/hook_status.rs`** is pure (no tmux/DB/TUI types): event mapping, atomic
   write-then-rename, staleness, and `merge_event`'s guard preventing a late `PreToolUse` from
   clearing a fresh `Blocked`
-- **Precedence** in the refresh thread: artifact → `Ready` > window gone → `Exited` > hook status >
-  pane-hash heuristic. Only *liveness* is replaced; artifact detection is untouched
+- **Precedence** in the refresh thread: fresh artifact with the turn over → `Ready` > window gone →
+  `Exited` > hook status > pane-hash heuristic (see *When a phase counts as done*). Only *liveness* is replaced; artifact detection is untouched
 - **Purely additive**: no status file means the pre-existing 15s pane-hash heuristic runs unchanged.
   A `working` record older than `HOOK_STALE_SECS` (300s) is distrusted and also falls back
 - The pane capture is skipped only on a **fresh `Working`** report — one fewer `capture-pane` per

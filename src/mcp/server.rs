@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -8,6 +11,8 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::board_watch::{BoardView, TaskMark};
+use crate::agent::hook_status::{AgentHookStatus, HookState};
 use crate::config::{GlobalConfig, ProjectConfig};
 use crate::core::actions::CallerKind;
 use crate::db::{Database, Task, TaskStatus, TransitionRequest};
@@ -28,10 +33,39 @@ pub enum ServerMode {
 pub struct ListProjectsParams {}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetConfigParams {
+    /// Project ID (required in global mode — call list_projects first to get IDs).
+    #[schemars(
+        description = "Project ID. Required in global mode. Call list_projects first to get project IDs."
+    )]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListTasksParams {
     /// Filter by status: "backlog", "planning", "running", "review", "done". Omit for all tasks.
     #[schemars(description = "Filter by status: backlog, planning, running, review, done")]
     pub status: Option<String>,
+    /// Include each task's description. Off by default: a description is most
+    /// of a listing's bytes and a polling caller wrote them itself.
+    #[schemars(
+        description = "Include each task's full description (default false). get_task always includes it."
+    )]
+    pub include_description: Option<bool>,
+    /// Project ID (required in global mode — call list_projects first to get IDs).
+    #[schemars(
+        description = "Project ID. Required in global mode. Call list_projects first to get project IDs."
+    )]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WaitForBoardChangeParams {
+    /// How long to wait for something to need you before answering anyway.
+    #[schemars(
+        description = "Seconds to wait before answering anyway (default 300, max 900). A timeout is not an error: it means nothing needed you."
+    )]
+    pub timeout_secs: Option<u64>,
     /// Project ID (required in global mode — call list_projects first to get IDs).
     #[schemars(
         description = "Project ID. Required in global mode. Call list_projects first to get project IDs."
@@ -253,20 +287,164 @@ struct ProjectSummary {
     path: String,
 }
 
+/// One card, as a polling caller sees it.
+///
+/// Every optional field is omitted when empty, and the description only on
+/// request: this is the response a supervising session receives most, and it
+/// re-reads each one on every later turn. Measured on a 14-task run,
+/// descriptions were 80% of a listing's bytes — text the caller wrote itself
+/// when it created the tasks.
 #[derive(Serialize)]
 struct TaskSummary {
     id: String,
     title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     status: String,
     agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     branch_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pr_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     plugin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     referenced_tasks: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     base_branch: Option<String>,
+    /// Why the task was flagged for a person — a merge conflict, an
+    /// escalation. Present only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    escalation_note: Option<String>,
     deps_satisfied: bool,
+    /// The TUI's published phase status, or `None` when nothing has been
+    /// observed for this task. Weigh it against `phase_age_secs` rather than
+    /// treating it as live — with no TUI running, nothing refreshes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_status: Option<String>,
+    /// How many seconds ago that status was observed. The refresh republishes
+    /// every live task on every pass, so a small age means "seen just now" and
+    /// a large one means nothing is watching this board — which is a different
+    /// problem from a task that is genuinely idle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_age_secs: Option<i64>,
 }
+
+/// The settings that decide how a run behaves, already merged.
+///
+/// Only the fields a caller acts on. The theme is not here — nothing driving
+/// the board makes a decision from it — and neither is anything secret.
+#[derive(Serialize)]
+struct EffectiveConfig {
+    /// Where these values came from, so a caller can say *which* file to edit
+    /// rather than guess at `~/.config/agtx/config.toml`.
+    global_config_path: String,
+    project_config_path: String,
+    project_config_exists: bool,
+    /// Whether agtx answers agents' trust and bypass-permission dialogs. When
+    /// false, an unattended run parks every task as `blocked` on its first
+    /// dialog with nobody to answer it. Global-only: a project config cannot
+    /// set this, because a repository must not be able to grant itself trust.
+    auto_trust: bool,
+    default_agent: String,
+    /// Per-phase overrides. A phase absent here uses `default_agent`.
+    phase_agents: serde_json::Value,
+    worktree_enabled: bool,
+    skip_worktree: bool,
+    auto_cleanup: bool,
+    /// Empty means auto-detect (main, then master).
+    base_branch: String,
+    worktree_dir: String,
+    branch_prefix: String,
+    workflow_plugin: Option<String>,
+    agent_hooks: bool,
+    github_url: Option<String>,
+}
+
+/// The board, plus the one fact that says whether any of it is live.
+///
+/// `tui_connected` belongs at board level rather than on each card: it is one
+/// answer for the whole project, and repeating it per task would imply it could
+/// differ between them. It is wrapped around the task list rather than offered
+/// as a separate tool because a caller needs it on *every* poll — a separate
+/// call is one a polling loop will skip, and skipping it means reading frozen
+/// rows as live state.
+#[derive(Serialize)]
+struct BoardListing {
+    /// Whether a TUI has beaten recently. When false, nothing is executing
+    /// queued transitions and every `phase_status` below is frozen at whatever
+    /// was last observed — stale, not current.
+    tui_connected: bool,
+    tasks: Vec<TaskSummary>,
+}
+
+/// The answer to `wait_for_board_change`: only what differs from what this
+/// session was last shown.
+#[derive(Serialize)]
+struct BoardChanges {
+    tui_connected: bool,
+    /// True when the wait ran out with nothing needing the caller. `tasks` can
+    /// still be non-empty — moves into states that ask nothing of it, such as
+    /// a task starting to work, are reported but do not wake a wait.
+    timed_out: bool,
+    tasks: Vec<TaskSummary>,
+    /// Ids of tasks this session was shown that no longer exist.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<String>,
+    /// Outcomes of `move_task` requests this session queued, since it was last
+    /// told. What makes polling `get_transition_status` unnecessary.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    transitions: Vec<ResolvedTransition>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ResolvedTransition {
+    request_id: String,
+    task_id: String,
+    action: String,
+    /// `completed` or `error`.
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// A `move_task` request this session queued and has not been told the
+/// outcome of.
+#[derive(Debug, Clone)]
+struct QueuedMove {
+    request_id: String,
+    task_id: String,
+    action: String,
+}
+
+/// One MCP session's view of one board, for `wait_for_board_change`.
+///
+/// Kept in the server because the server *is* the session: each client spawns
+/// its own `agtx mcp-serve` over stdio, so this map lives exactly as long as
+/// the caller it describes.
+#[derive(Debug, Default)]
+struct SessionBoard {
+    view: BoardView,
+    queued: Vec<QueuedMove>,
+    /// Outcomes found by a poll but not yet returned to the caller.
+    resolved: Vec<ResolvedTransition>,
+}
+
+/// One pass of a wait, read and folded into the session's view.
+struct BoardPoll {
+    snapshot: Vec<(TaskSummary, TaskMark)>,
+    tui_connected: bool,
+    wake: bool,
+}
+
+/// How long a wait lasts when the caller does not say.
+const DEFAULT_WAIT_SECS: u64 = 300;
+/// The longest wait a caller can ask for. A timeout is cheap — one turn — and
+/// a cap keeps a stuck call from outliving a client's own tool-call limit.
+const MAX_WAIT_SECS: u64 = 900;
+/// How often a wait re-reads the board. The TUI refreshes phase status every
+/// two seconds, so reading faster than this finds nothing new.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Serialize)]
 struct TaskDetail {
@@ -303,6 +481,19 @@ struct TaskDetail {
     /// the permission prompt or question text the agent itself reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     blocked_reason: Option<String>,
+    /// The TUI's own verdict on the phase: working, blocked, idle, ready or
+    /// exited. Distinct from `agent_state`, which is what the agent reports
+    /// about itself — this one also covers agents with no hooks, and is the
+    /// only signal that can say `ready` (the phase artifact exists) or
+    /// `exited` (the window is gone).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_status: Option<String>,
+    /// How many seconds ago `phase_status` was observed. See `TaskSummary`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_age_secs: Option<i64>,
+    /// Whether a TUI is running for this project. When false, `phase_status` is
+    /// frozen rather than current, and no queued transition will execute.
+    tui_connected: bool,
 }
 
 #[derive(Serialize)]
@@ -402,11 +593,23 @@ struct DeleteTaskResponse {
     message: String,
 }
 
+/// How long a TUI heartbeat stays trusted. Three beats of the TUI's
+/// `TRANSITION_POLL_INTERVAL`, so one missed tick is not read as a disconnect —
+/// the same window the web API applies, since the two answer the same question.
+const TUI_HEARTBEAT_STALE_AFTER: chrono::Duration = chrono::Duration::seconds(6);
+
 // === MCP Server ===
 
 #[derive(Debug, Clone)]
 pub struct AgtxMcpServer {
     mode: ServerMode,
+    /// When each project's `board_watch` row was last marked, so a read burst
+    /// costs one write rather than one per tool call. Shared across clones
+    /// because rmcp clones the server per request.
+    watched: Arc<Mutex<HashMap<String, Instant>>>,
+    /// What this session has been shown of each project's board, keyed by
+    /// project path. Shared across clones for the same reason as `watched`.
+    boards: Arc<Mutex<HashMap<String, SessionBoard>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -414,8 +617,236 @@ impl AgtxMcpServer {
     fn new(mode: ServerMode) -> Self {
         Self {
             mode,
+            watched: Arc::new(Mutex::new(HashMap::new())),
+            boards: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
+    }
+
+    fn project_key(&self, project_id: Option<&str>) -> Result<String, String> {
+        self.resolve_project_path(project_id)
+            .map(|p| p.to_string_lossy().to_string())
+    }
+
+    /// Run `f` on this session's view of a project's board.
+    fn with_board<R>(&self, key: &str, f: impl FnOnce(&mut SessionBoard) -> R) -> R {
+        let mut boards = self.boards.lock().unwrap_or_else(|e| e.into_inner());
+        f(boards.entry(key.to_string()).or_default())
+    }
+
+    /// When the agent's hook last reported a turn boundary — see
+    /// [`TaskMark::turn_ts`].
+    fn turn_ts(hook: Option<&AgentHookStatus>) -> Option<i64> {
+        hook.filter(|h| h.state != HookState::Working).map(|h| h.ts)
+    }
+
+    /// Summaries of `tasks`, each with the mark a wait compares.
+    ///
+    /// One runtime query for the whole board rather than one per task: this is
+    /// what a polling caller runs most, and the one that grows with the project.
+    fn board_snapshot(
+        db: &Database,
+        tasks: Vec<Task>,
+        include_description: bool,
+    ) -> Vec<(TaskSummary, TaskMark)> {
+        let runtime = db.list_task_runtime().unwrap_or_default();
+        let now = chrono::Utc::now().timestamp();
+        tasks
+            .into_iter()
+            .map(|t| {
+                let deps_satisfied = db.deps_satisfied(&t);
+                let (phase_status, phase_age_secs) =
+                    Self::runtime_fields(runtime.iter().find(|r| r.task_id == t.id), t.status);
+                let hook = t.worktree_path.as_ref().and_then(|wt| {
+                    crate::agent::hook_status::read_status(std::path::Path::new(wt), &t.id, now)
+                });
+                let mark = TaskMark {
+                    status: t.status,
+                    phase_status: phase_status.clone(),
+                    turn_ts: Self::turn_ts(hook.as_ref()),
+                    deps_satisfied,
+                    escalation_note: t.escalation_note.clone(),
+                };
+                let summary = TaskSummary {
+                    phase_status,
+                    phase_age_secs,
+                    id: t.id,
+                    title: t.title,
+                    description: t.description.filter(|_| include_description),
+                    status: t.status.as_str().to_string(),
+                    agent: t.agent,
+                    branch_name: t.branch_name,
+                    pr_url: t.pr_url,
+                    plugin: t.plugin,
+                    referenced_tasks: t.referenced_tasks,
+                    base_branch: t.base_branch,
+                    escalation_note: t.escalation_note,
+                    deps_satisfied,
+                };
+                (summary, mark)
+            })
+            .collect()
+    }
+
+    /// Record what a read tool just showed the caller, so the next wait does
+    /// not wake to show it again.
+    fn remember_seen<'a>(
+        &self,
+        project_id: Option<&str>,
+        seen: impl IntoIterator<Item = (&'a str, &'a TaskMark)>,
+        tui_connected: bool,
+    ) {
+        if let Ok(key) = self.project_key(project_id) {
+            self.with_board(&key, |b| b.view.mark_seen(seen, tui_connected));
+        }
+    }
+
+    /// One pass of a wait. Synchronous on purpose: the database handle and the
+    /// lock both stay inside it, so nothing is held across the wait's sleep.
+    fn poll_board(&self, project_id: Option<&str>, key: &str) -> Result<BoardPoll, String> {
+        // A wait is a reader for its whole length, not just when it starts: the
+        // TUI stops publishing phase status once nobody has read it for a while.
+        self.note_board_watched(project_id);
+        let db = self.open_project_db_for(project_id)?;
+        let tasks = db
+            .get_all_tasks()
+            .map_err(|e| format!("Error listing tasks: {}", e))?;
+        let snapshot = Self::board_snapshot(&db, tasks, false);
+        let tui_connected = self.tui_connected(project_id);
+        let marks: Vec<(String, TaskMark)> = snapshot
+            .iter()
+            .map(|(s, m)| (s.id.clone(), m.clone()))
+            .collect();
+
+        let wake = self.with_board(key, |board| {
+            // A failed move wakes: nothing on the board shows it, so it is the
+            // one outcome the caller cannot learn any other way. A completed
+            // one does not — the status it changed is already on the board.
+            let mut failed = false;
+            for q in std::mem::take(&mut board.queued) {
+                match db.get_transition_request(&q.request_id) {
+                    Ok(Some(req)) if req.processed_at.is_some() => {
+                        failed |= req.error.is_some();
+                        board.resolved.push(ResolvedTransition {
+                            request_id: q.request_id,
+                            task_id: q.task_id,
+                            action: q.action,
+                            status: if req.error.is_some() {
+                                "error"
+                            } else {
+                                "completed"
+                            }
+                            .to_string(),
+                            error: req.error,
+                        });
+                    }
+                    // Processed requests are deleted after an hour; one gone
+                    // before a wait saw it has nothing left to report.
+                    Ok(None) => {}
+                    _ => board.queued.push(q),
+                }
+            }
+            board.view.poll(&marks, tui_connected) || failed
+        });
+        Ok(BoardPoll {
+            snapshot,
+            tui_connected,
+            wake,
+        })
+    }
+
+    /// Answer a wait with what changed, and record that the caller has seen it.
+    fn answer_wait(&self, key: &str, poll: BoardPoll, timed_out: bool) -> String {
+        let marks: Vec<(String, TaskMark)> = poll
+            .snapshot
+            .iter()
+            .map(|(s, m)| (s.id.clone(), m.clone()))
+            .collect();
+        let (diff, transitions) = self.with_board(key, |board| {
+            (
+                board.view.report(&marks, poll.tui_connected),
+                std::mem::take(&mut board.resolved),
+            )
+        });
+        let changed: std::collections::HashSet<String> = diff.changed.into_iter().collect();
+        let changes = BoardChanges {
+            tui_connected: poll.tui_connected,
+            timed_out,
+            tasks: poll
+                .snapshot
+                .into_iter()
+                .filter(|(s, _)| changed.contains(&s.id))
+                .map(|(s, _)| s)
+                .collect(),
+            removed: diff.removed,
+            transitions,
+        };
+        serde_json::to_string_pretty(&changes)
+            .unwrap_or_else(|e| format!("Error serializing: {}", e))
+    }
+
+    /// Tell the TUI someone is reading this board, so it starts publishing
+    /// `task_runtime`.
+    ///
+    /// Publishing is gated on a recent reader because a board nobody reads
+    /// should cost no writes. An MCP client is such a reader — without this the
+    /// orchestrator and any oneshot session poll a table that is never written,
+    /// and every task reports no phase status forever.
+    ///
+    /// Throttled on the same reasoning as the web server's copy: the question
+    /// it answers resolves in minutes, and `get_task` is called once per task
+    /// in a polling loop.
+    fn note_board_watched(&self, project_id: Option<&str>) {
+        const NOTE_INTERVAL: Duration = Duration::from_secs(30);
+        let Ok(path) = self.resolve_project_path(project_id) else {
+            return;
+        };
+        let key = path.to_string_lossy().to_string();
+        {
+            let mut watched = self.watched.lock().unwrap_or_else(|e| e.into_inner());
+            if watched.get(&key).is_some_and(|at| at.elapsed() < NOTE_INTERVAL) {
+                return;
+            }
+            watched.insert(key.clone(), Instant::now());
+        }
+        if let Ok(db) = Database::open_global() {
+            let _ = db.note_board_watched(&key);
+        }
+    }
+
+    /// Whether a TUI has beaten for this project recently enough to be draining
+    /// the queue and refreshing phase status.
+    ///
+    /// Without this a caller can only *infer* a dead board from `phase_age_secs`
+    /// climbing across every task at once — and until it does, a frozen row
+    /// reads as live state: a task shows `blocked` while its agent works
+    /// normally.
+    fn tui_connected(&self, project_id: Option<&str>) -> bool {
+        let Ok(path) = self.resolve_project_path(project_id) else {
+            return false;
+        };
+        let Ok(db) = Database::open_global() else {
+            return false;
+        };
+        db.tui_is_live(&path.to_string_lossy(), TUI_HEARTBEAT_STALE_AFTER)
+            .unwrap_or(false)
+    }
+
+    /// The published phase status for a task, as `(status, age_secs)`.
+    ///
+    /// A row computed for a status the task has since left is withheld: it
+    /// describes the previous phase, and its `updated_at` is fresh, so age alone
+    /// cannot catch it. Returning nothing reads as "not yet observed", which is
+    /// what it is.
+    fn runtime_fields(
+        rt: Option<&crate::db::TaskRuntime>,
+        current: TaskStatus,
+    ) -> (Option<String>, Option<i64>) {
+        let rt = rt.filter(|r| r.status.map_or(true, |s| s == current));
+        (
+            rt.map(|r| r.phase_status.as_str().to_string()),
+            rt.map(|r| (chrono::Utc::now() - r.updated_at).num_seconds()),
+        )
     }
 
     /// Resolve a project path from an optional `project_id`.
@@ -516,10 +947,53 @@ impl AgtxMcpServer {
     }
 
     #[tool(
-        description = "List tasks for a project, optionally filtered by status (backlog, planning, running, review, done). In global mode, project_id is required — call list_projects first."
+        description = "Read the effective agtx configuration for a project — the global config merged with the project's own, which is what actually governs a run. Use this instead of reading ~/.config/agtx/config.toml: that path is not authoritative (AGTX_CONFIG_DIR relocates it), and a project config overrides much of it. Returns auto_trust (whether agents' trust dialogs are answered automatically — an unattended run needs this true), default_agent, per-phase agents, worktree settings, the active workflow plugin, and the paths both files live at."
+    )]
+    fn get_config(&self, Parameters(params): Parameters<GetConfigParams>) -> String {
+        tracing::info!(tool = "get_config", project_id = ?params.project_id, "MCP tool called");
+        let project_path = match self.resolve_project_path(params.project_id.as_deref()) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let global = GlobalConfig::load().unwrap_or_default();
+        let project = ProjectConfig::load(&project_path).unwrap_or_default();
+        let merged = crate::config::MergedConfig::merge(&global, &project);
+
+        let project_config_path = project_path.join(".agtx").join("config.toml");
+        let cfg = EffectiveConfig {
+            global_config_path: GlobalConfig::config_path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "<unresolved>".to_string()),
+            project_config_exists: project_config_path.exists(),
+            project_config_path: project_config_path.to_string_lossy().to_string(),
+            auto_trust: merged.auto_trust,
+            default_agent: merged.default_agent,
+            phase_agents: serde_json::json!({
+                "research": merged.phase_agents.research,
+                "planning": merged.phase_agents.planning,
+                "running": merged.phase_agents.running,
+                "review": merged.phase_agents.review,
+            }),
+            worktree_enabled: merged.worktree_enabled,
+            skip_worktree: merged.skip_worktree,
+            auto_cleanup: merged.auto_cleanup,
+            base_branch: merged.base_branch,
+            worktree_dir: merged.worktree_dir,
+            branch_prefix: merged.branch_prefix,
+            workflow_plugin: merged.workflow_plugin,
+            agent_hooks: merged.agent_hooks,
+            github_url: merged.github_url,
+        };
+        serde_json::to_string_pretty(&cfg)
+            .unwrap_or_else(|e| format!("Error serializing: {}", e))
+    }
+
+    #[tool(
+        description = "List tasks for a project, optionally filtered by status (backlog, planning, running, review, done). Descriptions are left out unless include_description is true — get_task has the full task. To watch the board, call wait_for_board_change instead of calling this in a loop. In global mode, project_id is required — call list_projects first."
     )]
     fn list_tasks(&self, Parameters(params): Parameters<ListTasksParams>) -> String {
         tracing::info!(tool = "list_tasks", status = ?params.status, project_id = ?params.project_id, "MCP tool called");
+        self.note_board_watched(params.project_id.as_deref());
         match self.open_project_db_for(params.project_id.as_deref()) {
             Ok(db) => {
                 let tasks_result = if let Some(status_str) = &params.status {
@@ -532,26 +1006,22 @@ impl AgtxMcpServer {
                 };
                 match tasks_result {
                     Ok(tasks) => {
-                        let summaries: Vec<TaskSummary> = tasks
-                            .into_iter()
-                            .map(|t| {
-                                let deps_satisfied = db.deps_satisfied(&t);
-                                TaskSummary {
-                                    id: t.id,
-                                    title: t.title,
-                                    description: t.description,
-                                    status: t.status.as_str().to_string(),
-                                    agent: t.agent,
-                                    branch_name: t.branch_name,
-                                    pr_url: t.pr_url,
-                                    plugin: t.plugin,
-                                    referenced_tasks: t.referenced_tasks,
-                                    base_branch: t.base_branch,
-                                    deps_satisfied,
-                                }
-                            })
-                            .collect();
-                        serde_json::to_string_pretty(&summaries)
+                        let snapshot = Self::board_snapshot(
+                            &db,
+                            tasks,
+                            params.include_description.unwrap_or(false),
+                        );
+                        let tui_connected = self.tui_connected(params.project_id.as_deref());
+                        self.remember_seen(
+                            params.project_id.as_deref(),
+                            snapshot.iter().map(|(s, m)| (s.id.as_str(), m)),
+                            tui_connected,
+                        );
+                        let listing = BoardListing {
+                            tui_connected,
+                            tasks: snapshot.into_iter().map(|(s, _)| s).collect(),
+                        };
+                        serde_json::to_string_pretty(&listing)
                             .unwrap_or_else(|e| format!("Error serializing: {}", e))
                     }
                     Err(e) => format!("Error listing tasks: {}", e),
@@ -566,6 +1036,7 @@ impl AgtxMcpServer {
     )]
     fn get_task(&self, Parameters(params): Parameters<GetTaskParams>) -> String {
         tracing::info!(tool = "get_task", task_id = %params.task_id, "MCP tool called");
+        self.note_board_watched(params.project_id.as_deref());
         match self.open_project_db_for(params.project_id.as_deref()) {
             Ok(db) => match db.get_task(&params.task_id) {
                 Ok(Some(t)) => {
@@ -611,8 +1082,26 @@ impl AgtxMcpServer {
                         .to_string()
                     });
                     let blocked_reason = hook.as_ref().and_then(|h| h.message.clone());
+                    let runtime = db.get_task_runtime(&params.task_id).ok().flatten();
+                    let (phase_status, phase_age_secs) = Self::runtime_fields(runtime.as_ref(), t.status);
+                    let tui_connected = self.tui_connected(params.project_id.as_deref());
+                    let mark = TaskMark {
+                        status: t.status,
+                        phase_status: phase_status.clone(),
+                        turn_ts: Self::turn_ts(hook.as_ref()),
+                        deps_satisfied: deps_ok,
+                        escalation_note: t.escalation_note.clone(),
+                    };
+                    self.remember_seen(
+                        params.project_id.as_deref(),
+                        [(t.id.as_str(), &mark)],
+                        tui_connected,
+                    );
 
                     let detail = TaskDetail {
+                        phase_status,
+                        phase_age_secs,
+                        tui_connected,
                         id: t.id,
                         title: t.title,
                         description: t.description,
@@ -648,7 +1137,42 @@ impl AgtxMcpServer {
     }
 
     #[tool(
-        description = "Queue a task state transition. The agtx TUI will process it and execute all side effects (worktree creation, agent spawning, etc). Use get_transition_status to check completion. Actions: research (start research phase for backlog task), move_forward, move_to_planning, move_to_running, move_to_review, move_to_done, resume, escalate_to_user (flag task for user attention with an optional reason)"
+        description = "Block until something on the board needs you, then return only what changed since you last looked (via this tool, list_tasks or get_task). Wakes when a task reaches ready, idle, blocked or exited, reaches Done, becomes startable in Backlog, is escalated, appears or is deleted; when one of your move_task requests fails; or when the TUI connects or disconnects. A task merely starting to work does not wake it. The first call returns the whole board. Also reports the outcome of every move_task you queued, so get_transition_status is not needed. Use this as the polling loop instead of sleeping and calling list_tasks. timed_out: true means nothing needed you. In global mode, project_id is required — call list_projects first."
+    )]
+    async fn wait_for_board_change(
+        &self,
+        Parameters(params): Parameters<WaitForBoardChangeParams>,
+    ) -> String {
+        tracing::info!(tool = "wait_for_board_change", timeout_secs = ?params.timeout_secs, "MCP tool called");
+        let timeout = Duration::from_secs(
+            params
+                .timeout_secs
+                .unwrap_or(DEFAULT_WAIT_SECS)
+                .clamp(1, MAX_WAIT_SECS),
+        );
+        let project_id = params.project_id.as_deref();
+        let key = match self.project_key(project_id) {
+            Ok(k) => k,
+            Err(e) => return e,
+        };
+        let started = Instant::now();
+        loop {
+            let poll = match self.poll_board(project_id, &key) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if poll.wake {
+                return self.answer_wait(&key, poll, false);
+            }
+            if started.elapsed() >= timeout {
+                return self.answer_wait(&key, poll, true);
+            }
+            tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+        }
+    }
+
+    #[tool(
+        description = "Queue a task state transition. The agtx TUI will process it and execute all side effects (worktree creation, agent spawning, etc). Use get_transition_status to check completion — a transition out of Backlog waits for the single worktree-setup slot, so it stays 'pending' until its turn. Actions: research (start research phase for backlog task), move_forward, move_to_planning, move_to_running, move_to_review, move_to_done, move_to_done_and_merge (merge the task branch into its base branch in the project checkout first, and stay in Review if it conflicts — for unattended callers that integrate locally instead of through a PR), resume, escalate_to_user (flag task for user attention with an optional reason)"
     )]
     fn move_task(&self, Parameters(params): Parameters<MoveTaskParams>) -> String {
         tracing::info!(tool = "move_task", task_id = %params.task_id, action = %params.action, "MCP tool called");
@@ -690,6 +1214,15 @@ impl AgtxMcpServer {
 
                 match db.create_transition_request(&req) {
                     Ok(()) => {
+                        if let Ok(key) = self.project_key(params.project_id.as_deref()) {
+                            self.with_board(&key, |b| {
+                                b.queued.push(QueuedMove {
+                                    request_id: request_id.clone(),
+                                    task_id: params.task_id.clone(),
+                                    action: params.action.clone(),
+                                })
+                            });
+                        }
                         let result = MoveTaskResult {
                             request_id,
                             message: format!(
@@ -848,7 +1381,7 @@ impl AgtxMcpServer {
     }
 
     #[tool(
-        description = "Read the last N lines of a task's agent tmux pane. Use this to understand what the agent is showing — e.g., when a task has been idle for a while. Returns pane content as text."
+        description = "Read the last N lines of what a task's agent pane shows (default 50), blank rows at the bottom dropped. Use this to understand what the agent is showing — e.g., when a task has been idle for a while. An agent that draws full-screen, like Claude Code, keeps no history outside its visible screen, so nothing older than that screen can be read this way. Ask for only as many lines as you need: the answer stays in your context."
     )]
     fn read_pane_content(&self, Parameters(params): Parameters<ReadPaneParams>) -> String {
         tracing::info!(tool = "read_pane_content", task_id = %params.task_id, "MCP tool called");
@@ -886,7 +1419,8 @@ impl AgtxMcpServer {
 
         match output {
             Ok(out) => {
-                let content = String::from_utf8_lossy(&out.stdout).to_string();
+                let content =
+                    crate::tmux::pane_tail(&String::from_utf8_lossy(&out.stdout), lines as usize);
                 let response = ReadPaneResponse {
                     task_id: params.task_id,
                     session_name,
@@ -901,7 +1435,7 @@ impl AgtxMcpServer {
     }
 
     #[tool(
-        description = "Send a message to a task's agent pane (followed by Enter). Only works for tasks in Planning or Running status. Use this to nudge a stuck agent, answer a CLI prompt (e.g. 'y' for yes), or provide guidance."
+        description = "Send a message to a task's agent pane (followed by Enter). Works for tasks in Planning, Running or Review. Use this to nudge a stuck agent, answer a CLI prompt (e.g. 'y' for yes), or provide guidance. In Review it is how to give the reviewer a small fix to make in place, without moving the task back to Running — resume is for significant rework."
     )]
     fn send_to_task(&self, Parameters(params): Parameters<SendToTaskParams>) -> String {
         tracing::info!(tool = "send_to_task", task_id = %params.task_id, "MCP tool called");
@@ -930,10 +1464,11 @@ impl AgtxMcpServer {
             Err(e) => return format!("Error getting task: {}", e),
         };
 
-        // Only allow sending to active phases
-        if !matches!(task.status, TaskStatus::Planning | TaskStatus::Running) {
+        // Review is included so a reviewer can be given a small fix in place;
+        // see `accepts_task_input`.
+        if !crate::core::actions::accepts_task_input(task.status) {
             return format!(
-                "Error: task is not in an active phase (current: {}). send_to_task only works for Planning or Running tasks.",
+                "Error: task has no agent to receive input (current: {}). send_to_task works for Planning, Running and Review tasks.",
                 task.status.as_str()
             );
         }
@@ -943,40 +1478,29 @@ impl AgtxMcpServer {
             None => return format!("Task {} has no active session", params.task_id),
         };
 
-        // Send the message text
-        let send_text = Command::new("tmux")
-            .args([
-                "-L",
-                "agtx",
-                "send-keys",
-                "-t",
-                &session_name,
-                &params.message,
-            ])
-            .output();
-
-        if let Err(e) = send_text {
-            return format!("Error sending message: {}", e);
+        // A bracketed paste, then a watched submit: the path agtx uses for every
+        // other whole message, via `core::input::send_user_text`.
+        //
+        // Not a raw `send-keys` of the text, which loses the head of a long
+        // message. Measured against Claude Code 2.1.268: a
+        // 1644-byte message typed that way arrived as its last 622 bytes, the first
+        // 1022 silently dropped, while the same bytes as a bracketed paste arrived
+        // whole. tmux and the pty are not the cause — a raw-mode `cat` received
+        // every byte by both methods — the agent's input handling discards the
+        // start of a large typed burst. The agent then acts on the tail of an
+        // instruction with its premise gone, which is worse than receiving nothing.
+        let tmux_ops: Arc<dyn crate::tmux::TmuxOperations> = Arc::new(crate::tmux::RealTmuxOps);
+        if !crate::core::input::send_user_text(&tmux_ops, &session_name, &params.message, true) {
+            return format!("Error sending message to {}", session_name);
         }
-
-        // Send Enter
-        let send_enter = Command::new("tmux")
-            .args(["-L", "agtx", "send-keys", "-t", &session_name, "Enter"])
-            .output();
-
-        match send_enter {
-            Ok(_) => {
-                let response = SendToTaskResponse {
-                    task_id: params.task_id,
-                    session_name,
-                    success: true,
-                    message: format!("Message sent: {}", params.message),
-                };
-                serde_json::to_string_pretty(&response)
-                    .unwrap_or_else(|e| format!("Error serializing: {}", e))
-            }
-            Err(e) => format!("Error sending Enter: {}", e),
-        }
+        let response = SendToTaskResponse {
+            task_id: params.task_id,
+            session_name,
+            success: true,
+            message: format!("Message sent: {}", params.message),
+        };
+        serde_json::to_string_pretty(&response)
+            .unwrap_or_else(|e| format!("Error serializing: {}", e))
     }
 
     #[tool(
@@ -1237,13 +1761,17 @@ impl ServerHandler for AgtxMcpServer {
                  Use list_tasks to see tasks, create_task or create_tasks_batch to add new tasks \
                  (with optional dependency wiring via referenced_tasks), update_task to modify backlog \
                  task fields, move_task to transition tasks between phases, get_transition_status to \
-                 check if a transition completed, and delete_task to remove backlog tasks.",
+                 check if a transition completed, and delete_task to remove backlog tasks. \
+                 To supervise the board, call wait_for_board_change in a loop rather than sleeping \
+                 and re-listing: it returns only what changed.",
             ServerMode::Project(_) =>
                 "agtx MCP server — control the terminal kanban board for coding agents. \
                  Use list_tasks to see current tasks, create_task or create_tasks_batch to add new tasks \
                  (with optional dependency wiring via referenced_tasks), update_task to modify backlog \
                  task fields, move_task to transition tasks between phases, get_transition_status to \
-                 check if a transition completed, and delete_task to remove backlog tasks.",
+                 check if a transition completed, and delete_task to remove backlog tasks. \
+                 To supervise the board, call wait_for_board_change in a loop rather than sleeping \
+                 and re-listing: it returns only what changed.",
         };
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(instructions)
